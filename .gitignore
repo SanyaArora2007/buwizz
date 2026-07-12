@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Machine-specific steering calibration cache (regenerated per build/session)
+steer_cal.json
+
+# Local Claude Code settings
+.claude/
