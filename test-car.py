@@ -83,7 +83,7 @@ BACKUP_TIME   = 5.0   # seconds to escape an obstacle (reverse, or forward for a
 TURN_DRIVE_TIME = 5.0 # seconds to drive with wheels turned to go around
 MAX_RECOVER_DEPTH = 2 # cap on chained forward<->reverse recoveries (boxed in)
 CRUISE_TIME   = 20.0  # seconds to cruise straight between obstacles  (spec: 20 s)
-MISSION_TIME  = 60.0  # overall run length                       (spec: ~a minute)
+MISSION_TIME  = 120.0 # overall run length (2 minutes)
 
 # Obstacle = commanding forward power but the drive motor isn't turning.
 STALL_VEL   = 4       # |drive velocity| below this counts as "not moving"
