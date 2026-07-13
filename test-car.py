@@ -34,6 +34,7 @@ BUWIZZ_SERVICE = "500592d1-74fb-4481-88b3-9919b1676e93"      # main service UUID
 APP_CHAR_HINT  = "2901"   # the application characteristic's distinguishing bytes
 
 CMD_SET_MOTOR      = 0x30  # 6x signed-8bit PWM (-127..127), + brake + lut bytes
+CMD_SET_MOTOR_EXT  = 0x31  # 4x int32 refs (ports 1-4, per PU mode) +2x int8 +brake+lut
 CMD_XFER_PERIOD    = 0x32  # status report period (ms, 20-255)
 CMD_MOTOR_TIMEOUT  = 0x34  # what to do when watchdog trips
 CMD_WATCHDOG       = 0x35  # auto-stop if no command within N seconds
@@ -73,6 +74,21 @@ CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 WATCHDOG_S    = 3     # auto-stop if no 0x35 command within this many seconds
 WATCHDOG_FEED = 0.5   # re-arm the watchdog at least this often while driving
+
+# ---- Obstacle-avoidance mission ---------------------------------------------
+REVERSE_SPEED = 85    # PWM used when backing away from an obstacle
+DRIVE_SPEED   = REVERSE_SPEED  # forward PWM (cruise/probe) -- same as reverse
+BACKUP_TIME   = 5.0   # seconds to escape an obstacle (reverse, or forward for a
+                      # rear hit) -- 5 s is enough at the higher reverse speed
+TURN_DRIVE_TIME = 5.0 # seconds to drive with wheels turned to go around
+MAX_RECOVER_DEPTH = 2 # cap on chained forward<->reverse recoveries (boxed in)
+CRUISE_TIME   = 20.0  # seconds to cruise straight between obstacles  (spec: 20 s)
+MISSION_TIME  = 60.0  # overall run length                       (spec: ~a minute)
+
+# Obstacle = commanding forward power but the drive motor isn't turning.
+STALL_VEL   = 4       # |drive velocity| below this counts as "not moving"
+STALL_TIME  = 0.4     # must stay stalled this long (while powered) -> obstacle
+DRIVE_GRACE = 0.6     # ignore stalls this long after starting to drive (spin-up)
 
 latest_status = {}
 disconnect_info = {"reason": None}
@@ -130,6 +146,18 @@ def servo_ref_packet(refs):
     for port, val in refs.items():
         r[port - 1] = int(val)
     return bytes([CMD_SET_SERVO_REF]) + b"".join(struct.pack("<i", x) for x in r)
+
+
+def motor_ext_packet(refs, brake=0, lut=0):
+    """Command 0x31: one packet that sets every PU port 1-4 by its own mode --
+    PWM (-127..127) for a simple-PWM port, degrees for a position-servo port.
+    Lets us drive one motor while holding another as a servo without the two
+    fighting over a shared 0x30/0x52 packet. refs: dict of port(1-4) -> ref."""
+    r = [0, 0, 0, 0]
+    for port, val in refs.items():
+        r[port - 1] = int(val)
+    body = b"".join(struct.pack("<i", x) for x in r)
+    return bytes([CMD_SET_MOTOR_EXT]) + body + bytes([0, 0, brake, lut])
 
 
 def parse_status(data):
@@ -225,11 +253,12 @@ async def servo_to(client, char, target_deg, timeout=STEER_TIMEOUT, tol=STEER_TO
                    hz=20):
     """Command the steering position servo to `target_deg` (motor degrees) and
     wait until the shaft reaches it (within `tol`) or `timeout` elapses. The
-    reference is re-sent every tick because BLE writes here are unacknowledged
-    and a lone packet can be dropped. Returns the angle actually reached; the
-    onboard PID keeps holding the target after this returns."""
+    command is re-sent every tick because BLE writes here are unacknowledged and
+    a lone packet can be dropped. The drive motor is explicitly held at zero so
+    the car stays put while the wheels turn. Returns the angle actually reached;
+    the onboard PID keeps holding the target after this returns."""
     target = int(target_deg)
-    pkt = servo_ref_packet({STEER_PORT: target})
+    pkt = motor_ext_packet({DRIVE_PORT: 0, STEER_PORT: target})
     end = time.time() + timeout
     last_feed = 0.0
     actual = None
@@ -331,7 +360,146 @@ async def steer_to_fraction(client, char, frac):
           f"actual={shown} deg (motor)")
 
 
-async def main(recalibrate=False):
+# ---- Obstacle-avoidance behavior --------------------------------------------
+def steer_target(frac):
+    """Motor-degree servo target for a steering fraction (-1 left .. +1 right)."""
+    frac = max(-1.0, min(1.0, frac))
+    return steer_cal["center"] + frac * steer_cal["half"] * STEER_MARGIN
+
+
+def drive_vel():
+    """Current drive-motor velocity (signed), or None if not reported yet."""
+    v = latest_status.get("vel", [])
+    return v[DRIVE_PORT - 1] if len(v) >= DRIVE_PORT else None
+
+
+async def drive(client, char, pwm, seconds, steer_deg, detect=True, hz=20):
+    """Drive the drive motor at `pwm` for up to `seconds` while holding the
+    steering servo at `steer_deg` (motor degrees), via a single 0x31 packet so
+    the drive and steer commands never zero each other out.
+
+    If `detect` is set and we are commanding motion (pwm != 0) but the drive
+    motor's velocity stays near zero past the spin-up grace period, we treat it
+    as an obstacle -- in whichever direction we're going -- stop the drive
+    (steering held) and return True. Otherwise return False after the full
+    duration."""
+    drive_pkt = motor_ext_packet({DRIVE_PORT: pwm, STEER_PORT: int(steer_deg)})
+    hold_pkt = motor_ext_packet({DRIVE_PORT: 0, STEER_PORT: int(steer_deg)})
+    start = time.time()
+    end = start + seconds
+    last_feed = last_print = 0.0
+    stalled_since = None
+    while time.time() < end:
+        await send(client, char, drive_pkt)
+        now = time.time()
+        if now - last_feed > WATCHDOG_FEED:
+            await feed_watchdog(client, char)
+            last_feed = now
+
+        v = drive_vel()
+        if detect and pwm != 0 and now - start > DRIVE_GRACE:
+            if v is not None and abs(v) < STALL_VEL:
+                stalled_since = stalled_since or now
+                if now - stalled_since >= STALL_TIME:
+                    await send(client, char, hold_pkt)  # stop drive, hold steer
+                    where = "ahead" if pwm > 0 else "behind"
+                    print(f"    ! stalled (vel~{v}) -> obstacle {where}")
+                    return True
+            else:
+                stalled_since = None
+
+        if now - last_print > 0.5:
+            c = latest_status.get("currents", [0] * 6)
+            print(f"    pwm={pwm:+d}  drive_vel={v}  I(drive)={c[DRIVE_PORT-1]}A")
+            last_print = now
+        await asyncio.sleep(1 / hz)
+    return False
+
+
+async def obstacle(client, char, depth=0):
+    """Recovery after the car hits something while moving FORWARD: back away,
+    then try to steer around it. Mirror of reverse_obstacle()."""
+    return await _recover(client, char, going_forward=True, depth=depth)
+
+
+async def reverse_obstacle(client, char, depth=0):
+    """Recovery after the car hits something while REVERSING: pull FORWARD away,
+    then try to steer around it in reverse. Mirror of obstacle() -- same moves,
+    just the opposite escape direction."""
+    return await _recover(client, char, going_forward=False, depth=depth)
+
+
+async def _recover(client, char, going_forward, depth):
+    """Shared recovery body. `going_forward` is the direction we were travelling
+    when we hit, so we escape the opposite way and probe (try to go around) in
+    the original direction. If we bump a new obstacle while escaping, we recover
+    the other way -- bounded by MAX_RECOVER_DEPTH so a boxed-in car can't loop
+    forever. Leaves the wheels straight."""
+    center = steer_target(0.0)
+    right = steer_target(+1.0)
+    # Escape opposite to travel; probe (wheels turned) in the travel direction.
+    if going_forward:
+        escape_pwm, probe_pwm = -REVERSE_SPEED, DRIVE_SPEED
+        escape_name, probe_name = "reverse", "forward"
+    else:
+        escape_pwm, probe_pwm = DRIVE_SPEED, -REVERSE_SPEED
+        escape_name, probe_name = "forward", "reverse"
+    hit_dir = "front" if going_forward else "rear"
+    print(f"  ! {hit_dir} obstacle -- running recovery (depth {depth})")
+
+    # 1. Escape straight away from the obstacle. Watch for a new obstacle in the
+    #    escape direction (unless we're at the depth cap): if we bump one while
+    #    escaping, recover the other way instead (front<->reverse mirror).
+    print(f"  recovery: {escape_name}")
+    detect_escape = depth < MAX_RECOVER_DEPTH
+    if await drive(client, char, escape_pwm, BACKUP_TIME, center, detect=detect_escape):
+        print(f"  recovery: bumped something while moving {escape_name}")
+        await _recover(client, char, not going_forward, depth + 1)
+        return
+
+    # 2. Stop, turn the wheels right, then go around in the travel direction.
+    print(f"  recovery: wheels right, {probe_name}")
+    await servo_to(client, char, right)
+    await drive(client, char, probe_pwm, TURN_DRIVE_TIME, right)
+
+    # 3. Straighten up; the mission loop resumes cruising.
+    print("  recovery: straighten")
+    await servo_to(client, char, center)
+
+
+async def run_mission(client, char):
+    """Cruise forward and avoid obstacles for about MISSION_TIME seconds. Each
+    hit triggers the obstacle() recovery, then we straighten and cruise again."""
+    center = steer_target(0.0)
+    print(f"\nObstacle-avoidance mission (~{MISSION_TIME:.0f}s)...\n")
+    await servo_to(client, char, center)          # wheels straight
+    deadline = time.time() + MISSION_TIME
+    while time.time() < deadline:
+        secs = min(CRUISE_TIME, deadline - time.time())
+        print("  cruise forward")
+        if await drive(client, char, DRIVE_SPEED, secs, center):
+            await obstacle(client, char)          # recover, then loop and cruise
+    print("\nMission time reached.")
+
+
+async def run_selftest(client, char):
+    """Original fixed motion self-test (drive + steer sweep)."""
+    print("\nRunning motion self-test...\n")
+    print("  drive forward (crawl)")
+    await hold(client, char, {DRIVE_PORT: 80}, 2.0)
+    print("  stop")
+    await hold(client, char, {}, 1.0)
+    print("  steer full left")
+    await steer_to_fraction(client, char, -1.0)
+    print("  steer full right")
+    await steer_to_fraction(client, char, 1.0)
+    print("  center")
+    await steer_to_fraction(client, char, 0.0)
+    print("  drive reverse (crawl)")
+    await hold(client, char, {DRIVE_PORT: -80}, 2.0)
+
+
+async def main(recalibrate=False, selftest=False):
     print(f"Scanning for {DEVICE_NAME} ...")
     device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=15.0)
     if device is None:
@@ -378,25 +546,13 @@ async def main(recalibrate=False):
             if await calibrate_steering(client, app):
                 save_cache(steer_cal["half"])
 
-        print("\nRunning motion self-test...\n")
-
         try:
-            print("  drive forward (crawl)")
-            await hold(client, app, {DRIVE_PORT:  80}, 2.0)
-            print("  stop")
-            await hold(client, app, {}, 1.0)
-
-            print("  steer full left")
-            await steer_to_fraction(client, app, -1.0)
-            print("  steer full right")
-            await steer_to_fraction(client, app,  1.0)
-            print("  center")
-            await steer_to_fraction(client, app, 0.0)
-
-            print("  drive reverse (crawl)")
-            await hold(client, app, {DRIVE_PORT: -80}, 2.0)
+            if selftest:
+                await run_selftest(client, app)
+            else:
+                await run_mission(client, app)
         except ConnectionError as e:
-            print(f"\nAborting self-test: {e}")
+            print(f"\nAborting: {e}")
         finally:
             # Only try to stop the motors if we're still connected; otherwise
             # the write would just raise again and mask the real cause.
@@ -417,6 +573,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--recalibrate", action="store_true",
         help="Only re-run the full steering calibration and save it, then exit "
-             "(skip the motion self-test).")
+             "(skip driving).")
+    parser.add_argument(
+        "--selftest", action="store_true",
+        help="Run the fixed motion self-test instead of the obstacle-avoidance "
+             "mission.")
     args = parser.parse_args()
-    asyncio.run(main(recalibrate=args.recalibrate))
+    asyncio.run(main(recalibrate=args.recalibrate, selftest=args.selftest))
