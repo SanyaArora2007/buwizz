@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import json
 import os
+import random
 import struct
 import time
 from bleak import BleakScanner, BleakClient
@@ -77,13 +78,20 @@ WATCHDOG_FEED = 0.5   # re-arm the watchdog at least this often while driving
 
 # ---- Obstacle-avoidance mission ---------------------------------------------
 REVERSE_SPEED = 85    # PWM used when backing away from an obstacle
-DRIVE_SPEED   = REVERSE_SPEED  # forward PWM (cruise/probe) -- same as reverse
+DRIVE_SPEED   = REVERSE_SPEED  # forward PWM (cruise) -- same as reverse
+TURN_SPEED    = 100   # PWM while going around with wheels turned (a bit faster)
 BACKUP_TIME   = 5.0   # seconds to escape an obstacle (reverse, or forward for a
                       # rear hit) -- 5 s is enough at the higher reverse speed
 TURN_DRIVE_TIME = 5.0 # seconds to drive with wheels turned to go around
 MAX_RECOVER_DEPTH = 2 # cap on chained forward<->reverse recoveries (boxed in)
-CRUISE_TIME   = 20.0  # seconds to cruise straight between obstacles  (spec: 20 s)
-MISSION_TIME  = 120.0 # overall run length (2 minutes)
+MISSION_TIME  = 120.0 # default overall run length (2 min); see --duration
+
+# Cruise acceleration: every ACCEL_INTERVAL seconds of clear straight driving,
+# bump the speed by ACCEL_STEP (up to ACCEL_MAX). Resets to DRIVE_SPEED after
+# each obstacle, so the car speeds up only while it knows the path is clear.
+ACCEL_INTERVAL = 5.0  # seconds of clear driving before each speed bump
+ACCEL_STEP     = 10   # PWM added per interval
+ACCEL_MAX      = 120  # top cruise PWM (out of 127)
 
 # Obstacle = commanding forward power but the drive motor isn't turning.
 STALL_VEL   = 4       # |drive velocity| below this counts as "not moving"
@@ -373,25 +381,34 @@ def drive_vel():
     return v[DRIVE_PORT - 1] if len(v) >= DRIVE_PORT else None
 
 
-async def drive(client, char, pwm, seconds, steer_deg, detect=True, hz=20):
+async def drive(client, char, pwm, seconds, steer_deg, detect=True, accelerate=False,
+                hz=20):
     """Drive the drive motor at `pwm` for up to `seconds` while holding the
     steering servo at `steer_deg` (motor degrees), via a single 0x31 packet so
     the drive and steer commands never zero each other out.
+
+    If `accelerate` is set, the (forward) speed ramps up by ACCEL_STEP every
+    ACCEL_INTERVAL seconds of clear driving, capped at ACCEL_MAX -- used for
+    cruising, where a long stretch without a hit means the way is clear.
 
     If `detect` is set and we are commanding motion (pwm != 0) but the drive
     motor's velocity stays near zero past the spin-up grace period, we treat it
     as an obstacle -- in whichever direction we're going -- stop the drive
     (steering held) and return True. Otherwise return False after the full
     duration."""
-    drive_pkt = motor_ext_packet({DRIVE_PORT: pwm, STEER_PORT: int(steer_deg)})
     hold_pkt = motor_ext_packet({DRIVE_PORT: 0, STEER_PORT: int(steer_deg)})
     start = time.time()
     end = start + seconds
     last_feed = last_print = 0.0
     stalled_since = None
+    cur_pwm = pwm
     while time.time() < end:
-        await send(client, char, drive_pkt)
         now = time.time()
+        if accelerate:
+            steps = int((now - start) // ACCEL_INTERVAL)
+            cur_pwm = min(ACCEL_MAX, pwm + steps * ACCEL_STEP)
+        await send(client, char,
+                   motor_ext_packet({DRIVE_PORT: cur_pwm, STEER_PORT: int(steer_deg)}))
         if now - last_feed > WATCHDOG_FEED:
             await feed_watchdog(client, char)
             last_feed = now
@@ -410,7 +427,7 @@ async def drive(client, char, pwm, seconds, steer_deg, detect=True, hz=20):
 
         if now - last_print > 0.5:
             c = latest_status.get("currents", [0] * 6)
-            print(f"    pwm={pwm:+d}  drive_vel={v}  I(drive)={c[DRIVE_PORT-1]}A")
+            print(f"    pwm={cur_pwm:+d}  drive_vel={v}  I(drive)={c[DRIVE_PORT-1]}A")
             last_print = now
         await asyncio.sleep(1 / hz)
     return False
@@ -436,13 +453,16 @@ async def _recover(client, char, going_forward, depth):
     the other way -- bounded by MAX_RECOVER_DEPTH so a boxed-in car can't loop
     forever. Leaves the wheels straight."""
     center = steer_target(0.0)
-    right = steer_target(+1.0)
+    # Randomly try around to the right or the left each time.
+    turn_frac = random.choice([-1.0, 1.0])
+    turn = steer_target(turn_frac)
+    turn_name = "right" if turn_frac > 0 else "left"
     # Escape opposite to travel; probe (wheels turned) in the travel direction.
     if going_forward:
-        escape_pwm, probe_pwm = -REVERSE_SPEED, DRIVE_SPEED
+        escape_pwm, probe_pwm = -REVERSE_SPEED, TURN_SPEED
         escape_name, probe_name = "reverse", "forward"
     else:
-        escape_pwm, probe_pwm = DRIVE_SPEED, -REVERSE_SPEED
+        escape_pwm, probe_pwm = DRIVE_SPEED, -TURN_SPEED
         escape_name, probe_name = "forward", "reverse"
     hit_dir = "front" if going_forward else "rear"
     print(f"  ! {hit_dir} obstacle -- running recovery (depth {depth})")
@@ -457,27 +477,28 @@ async def _recover(client, char, going_forward, depth):
         await _recover(client, char, not going_forward, depth + 1)
         return
 
-    # 2. Stop, turn the wheels right, then go around in the travel direction.
-    print(f"  recovery: wheels right, {probe_name}")
-    await servo_to(client, char, right)
-    await drive(client, char, probe_pwm, TURN_DRIVE_TIME, right)
+    # 2. Stop, turn the wheels (random side), then go around in travel direction.
+    print(f"  recovery: wheels {turn_name}, {probe_name}")
+    await servo_to(client, char, turn)
+    await drive(client, char, probe_pwm, TURN_DRIVE_TIME, turn)
 
     # 3. Straighten up; the mission loop resumes cruising.
     print("  recovery: straighten")
     await servo_to(client, char, center)
 
 
-async def run_mission(client, char):
-    """Cruise forward and avoid obstacles for about MISSION_TIME seconds. Each
-    hit triggers the obstacle() recovery, then we straighten and cruise again."""
+async def run_mission(client, char, duration=MISSION_TIME):
+    """Cruise forward and avoid obstacles for about `duration` seconds. Cruising
+    accelerates while the path stays clear; each hit triggers the obstacle()
+    recovery, then we straighten and cruise again (back at the base speed)."""
     center = steer_target(0.0)
-    print(f"\nObstacle-avoidance mission (~{MISSION_TIME:.0f}s)...\n")
+    print(f"\nObstacle-avoidance mission (~{duration:.0f}s)...\n")
     await servo_to(client, char, center)          # wheels straight
-    deadline = time.time() + MISSION_TIME
+    deadline = time.time() + duration
     while time.time() < deadline:
-        secs = min(CRUISE_TIME, deadline - time.time())
+        secs = deadline - time.time()
         print("  cruise forward")
-        if await drive(client, char, DRIVE_SPEED, secs, center):
+        if await drive(client, char, DRIVE_SPEED, secs, center, accelerate=True):
             await obstacle(client, char)          # recover, then loop and cruise
     print("\nMission time reached.")
 
@@ -499,7 +520,7 @@ async def run_selftest(client, char):
     await hold(client, char, {DRIVE_PORT: -80}, 2.0)
 
 
-async def main(recalibrate=False, selftest=False):
+async def main(recalibrate=False, selftest=False, duration=MISSION_TIME):
     print(f"Scanning for {DEVICE_NAME} ...")
     device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=15.0)
     if device is None:
@@ -550,7 +571,7 @@ async def main(recalibrate=False, selftest=False):
             if selftest:
                 await run_selftest(client, app)
             else:
-                await run_mission(client, app)
+                await run_mission(client, app, duration)
         except ConnectionError as e:
             print(f"\nAborting: {e}")
         finally:
@@ -578,5 +599,10 @@ if __name__ == "__main__":
         "--selftest", action="store_true",
         help="Run the fixed motion self-test instead of the obstacle-avoidance "
              "mission.")
+    parser.add_argument(
+        "--duration", type=float, default=MISSION_TIME, metavar="SECONDS",
+        help=f"How long to run the obstacle-avoidance mission, in seconds "
+             f"(default {MISSION_TIME:.0f} = 2 minutes).")
     args = parser.parse_args()
-    asyncio.run(main(recalibrate=args.recalibrate, selftest=args.selftest))
+    asyncio.run(main(recalibrate=args.recalibrate, selftest=args.selftest,
+                     duration=args.duration))
