@@ -487,18 +487,20 @@ async def _recover(client, char, going_forward, depth):
     await servo_to(client, char, center)
 
 
-async def run_mission(client, char, duration=MISSION_TIME):
-    """Cruise forward and avoid obstacles for about `duration` seconds. Cruising
-    accelerates while the path stays clear; each hit triggers the obstacle()
-    recovery, then we straighten and cruise again (back at the base speed)."""
+async def run_mission(client, char, duration=MISSION_TIME, accelerate=False):
+    """Cruise forward and avoid obstacles for about `duration` seconds. If
+    `accelerate` is set, cruising speeds up while the path stays clear; each hit
+    triggers the obstacle() recovery, then we straighten and cruise again (back
+    at the base speed)."""
     center = steer_target(0.0)
-    print(f"\nObstacle-avoidance mission (~{duration:.0f}s)...\n")
+    print(f"\nObstacle-avoidance mission (~{duration:.0f}s"
+          f"{', accelerating' if accelerate else ''})...\n")
     await servo_to(client, char, center)          # wheels straight
     deadline = time.time() + duration
     while time.time() < deadline:
         secs = deadline - time.time()
         print("  cruise forward")
-        if await drive(client, char, DRIVE_SPEED, secs, center, accelerate=True):
+        if await drive(client, char, DRIVE_SPEED, secs, center, accelerate=accelerate):
             await obstacle(client, char)          # recover, then loop and cruise
     print("\nMission time reached.")
 
@@ -520,7 +522,8 @@ async def run_selftest(client, char):
     await hold(client, char, {DRIVE_PORT: -80}, 2.0)
 
 
-async def main(recalibrate=False, selftest=False, duration=MISSION_TIME):
+async def main(recalibrate=False, selftest=False, duration=MISSION_TIME,
+               accelerate=False):
     print(f"Scanning for {DEVICE_NAME} ...")
     device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=15.0)
     if device is None:
@@ -571,7 +574,7 @@ async def main(recalibrate=False, selftest=False, duration=MISSION_TIME):
             if selftest:
                 await run_selftest(client, app)
             else:
-                await run_mission(client, app, duration)
+                await run_mission(client, app, duration, accelerate)
         except ConnectionError as e:
             print(f"\nAborting: {e}")
         finally:
@@ -603,6 +606,9 @@ if __name__ == "__main__":
         "--duration", type=float, default=MISSION_TIME, metavar="SECONDS",
         help=f"How long to run the obstacle-avoidance mission, in seconds "
              f"(default {MISSION_TIME:.0f} = 2 minutes).")
+    parser.add_argument(
+        "--accelerate", action="store_true",
+        help="Speed up while cruising a clear path (off by default).")
     args = parser.parse_args()
     asyncio.run(main(recalibrate=args.recalibrate, selftest=args.selftest,
-                     duration=args.duration))
+                     duration=args.duration, accelerate=args.accelerate))
