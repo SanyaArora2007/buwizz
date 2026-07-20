@@ -79,18 +79,19 @@ WATCHDOG_FEED = 0.5   # re-arm the watchdog at least this often while driving
 # ---- Obstacle-avoidance mission ---------------------------------------------
 REVERSE_SPEED = 85    # PWM used when backing away from an obstacle
 DRIVE_SPEED   = REVERSE_SPEED  # forward PWM (cruise) -- same as reverse
-TURN_SPEED    = 100   # PWM while going around with wheels turned (a bit faster)
+TURN_SPEED    = 95    # PWM while going around with wheels turned
 BACKUP_TIME   = 5.0   # seconds to escape an obstacle (reverse, or forward for a
                       # rear hit) -- 5 s is enough at the higher reverse speed
 TURN_DRIVE_TIME = 5.0 # seconds to drive with wheels turned to go around
 MAX_RECOVER_DEPTH = 2 # cap on chained forward<->reverse recoveries (boxed in)
 MISSION_TIME  = 120.0 # default overall run length (2 min); see --duration
+STRAIGHT_MAX  = 10.0  # max seconds of straight driving before a random turn
 
 # Cruise acceleration: every ACCEL_INTERVAL seconds of clear straight driving,
 # bump the speed by ACCEL_STEP (up to ACCEL_MAX). Resets to DRIVE_SPEED after
 # each obstacle, so the car speeds up only while it knows the path is clear.
 ACCEL_INTERVAL = 5.0  # seconds of clear driving before each speed bump
-ACCEL_STEP     = 10   # PWM added per interval
+ACCEL_STEP     = 5    # PWM added per interval
 ACCEL_MAX      = 120  # top cruise PWM (out of 127)
 
 # Obstacle = commanding forward power but the drive motor isn't turning.
@@ -487,20 +488,44 @@ async def _recover(client, char, going_forward, depth):
     await servo_to(client, char, center)
 
 
+async def random_turn(client, char):
+    """Turn a random direction (no obstacle involved) to break up a long
+    straight run: pick a side, drive with the wheels turned for a bit, then
+    straighten. Returns True if it bumped an obstacle mid-turn (caller recovers);
+    otherwise straightens and returns False."""
+    center = steer_target(0.0)
+    turn_frac = random.choice([-1.0, 1.0])
+    turn = steer_target(turn_frac)
+    turn_name = "right" if turn_frac > 0 else "left"
+    print(f"  straight-line timeout -> random turn {turn_name}")
+    await servo_to(client, char, turn)
+    if await drive(client, char, TURN_SPEED, TURN_DRIVE_TIME, turn):
+        return True
+    await servo_to(client, char, center)
+    return False
+
+
 async def run_mission(client, char, duration=MISSION_TIME, accelerate=False):
-    """Cruise forward and avoid obstacles for about `duration` seconds. If
-    `accelerate` is set, cruising speeds up while the path stays clear; each hit
-    triggers the obstacle() recovery, then we straighten and cruise again (back
-    at the base speed)."""
+    """Cruise forward and avoid obstacles for about `duration` seconds. Straight
+    driving is capped at STRAIGHT_MAX seconds -- after that we make a random turn
+    even with a clear path. If `accelerate` is set, cruising speeds up while the
+    path stays clear; each hit triggers the obstacle() recovery, then we
+    straighten and cruise again (back at the base speed)."""
     center = steer_target(0.0)
     print(f"\nObstacle-avoidance mission (~{duration:.0f}s"
           f"{', accelerating' if accelerate else ''})...\n")
     await servo_to(client, char, center)          # wheels straight
     deadline = time.time() + duration
     while time.time() < deadline:
-        secs = deadline - time.time()
+        secs = min(STRAIGHT_MAX, deadline - time.time())
         print("  cruise forward")
-        if await drive(client, char, DRIVE_SPEED, secs, center, accelerate=accelerate):
+        hit = await drive(client, char, DRIVE_SPEED, secs, center,
+                          accelerate=accelerate)
+        # Finished the straight segment without a hit, with time to spare ->
+        # the 10 s cap tripped, so make a random turn.
+        if not hit and time.time() < deadline:
+            hit = await random_turn(client, char)
+        if hit:
             await obstacle(client, char)          # recover, then loop and cruise
     print("\nMission time reached.")
 
