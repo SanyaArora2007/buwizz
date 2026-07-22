@@ -85,7 +85,9 @@ BACKUP_TIME   = 5.0   # seconds to escape an obstacle (reverse, or forward for a
 TURN_DRIVE_TIME = 5.0 # seconds to drive with wheels turned to go around
 MAX_RECOVER_DEPTH = 2 # cap on chained forward<->reverse recoveries (boxed in)
 MISSION_TIME  = 120.0 # default overall run length (2 min); see --duration
-STRAIGHT_MAX  = 10.0  # max seconds of straight driving before a random turn
+STRAIGHT_MAX  = 10.0  # max seconds of straight driving before a gentle turn
+SMOOTH_TURN_FRAC = 0.5  # how far to steer for that turn (fraction of full lock)
+SMOOTH_TURN_TIME = 3.0  # seconds to hold the gentle turn before straightening
 
 # Cruise acceleration: every ACCEL_INTERVAL seconds of clear straight driving,
 # bump the speed by ACCEL_STEP (up to ACCEL_MAX). Resets to DRIVE_SPEED after
@@ -450,9 +452,10 @@ async def reverse_obstacle(client, char, depth=0):
 async def _recover(client, char, going_forward, depth):
     """Shared recovery body. `going_forward` is the direction we were travelling
     when we hit, so we escape the opposite way and probe (try to go around) in
-    the original direction. If we bump a new obstacle while escaping, we recover
-    the other way -- bounded by MAX_RECOVER_DEPTH so a boxed-in car can't loop
-    forever. Leaves the wheels straight."""
+    the original direction. The go-around is a smooth turn -- the wheels swing
+    over while the car keeps moving, and the next cruise segment eases them back
+    to straight. If we bump a new obstacle while escaping, we recover the other
+    way -- bounded by MAX_RECOVER_DEPTH so a boxed-in car can't loop forever."""
     center = steer_target(0.0)
     # Randomly try around to the right or the left each time.
     turn_frac = random.choice([-1.0, 1.0])
@@ -478,31 +481,27 @@ async def _recover(client, char, going_forward, depth):
         await _recover(client, char, not going_forward, depth + 1)
         return
 
-    # 2. Stop, turn the wheels (random side), then go around in travel direction.
-    print(f"  recovery: wheels {turn_name}, {probe_name}")
-    await servo_to(client, char, turn)
+    # 2. Go around in the travel direction with a SMOOTH turn: no stop -- the
+    #    wheels swing to the turn angle while the car keeps moving. They ease
+    #    back to straight in the next cruise segment (also while moving).
+    print(f"  recovery: {probe_name}, smooth {turn_name} turn")
     await drive(client, char, probe_pwm, TURN_DRIVE_TIME, turn)
-
-    # 3. Straighten up; the mission loop resumes cruising.
-    print("  recovery: straighten")
-    await servo_to(client, char, center)
 
 
 async def random_turn(client, char):
-    """Turn a random direction (no obstacle involved) to break up a long
-    straight run: pick a side, drive with the wheels turned for a bit, then
-    straighten. Returns True if it bumped an obstacle mid-turn (caller recovers);
-    otherwise straightens and returns False."""
-    center = steer_target(0.0)
-    turn_frac = random.choice([-1.0, 1.0])
+    """After a long straight run, ease into a gentle turn WITHOUT stopping: keep
+    driving forward while nudging the wheels to a slight random (left/right)
+    angle for SMOOTH_TURN_TIME seconds. The wheels aren't straightened here -- the
+    next cruise segment eases them back to center, also while moving, for one
+    continuous smooth curve. Returns True if an obstacle was hit mid-turn (caller
+    recovers)."""
+    turn_frac = random.choice([-1.0, 1.0]) * SMOOTH_TURN_FRAC
     turn = steer_target(turn_frac)
     turn_name = "right" if turn_frac > 0 else "left"
-    print(f"  straight-line timeout -> random turn {turn_name}")
-    await servo_to(client, char, turn)
-    if await drive(client, char, TURN_SPEED, TURN_DRIVE_TIME, turn):
-        return True
-    await servo_to(client, char, center)
-    return False
+    print(f"  straight-line timeout -> gentle {turn_name} turn (while moving)")
+    # Drive forward at cruise speed while holding the slight steer angle; the
+    # steering servo eases over as the car keeps rolling -> a smooth curve.
+    return await drive(client, char, DRIVE_SPEED, SMOOTH_TURN_TIME, turn)
 
 
 async def run_mission(client, char, duration=MISSION_TIME, accelerate=False):
